@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import csv
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,15 @@ from quart import (
 
 _LOGGER = logging.getLogger(__name__)
 _DIR = Path(__file__).parent
+
+# Login codes must be a plain token — never a path (blocks path traversal via
+# "user_" + userId, including absolute paths that pathlib would otherwise
+# splice straight past the intended output directory).
+_USER_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def is_safe_user_id(user_id) -> bool:
+    return bool(user_id) and _USER_ID_RE.match(user_id) is not None
 
 
 @dataclass
@@ -71,6 +81,14 @@ def main() -> None:
     webfonts_dir = _DIR / "webfonts"
 
     prompts, languages = load_prompts(prompts_dirs)
+    # Authoritative (group, id) pairs per language, derived from files already
+    # loaded from disk — used to reject any client-supplied promptGroup/promptId
+    # that doesn't correspond to a real prompt, instead of trusting form input
+    # when building filesystem paths.
+    prompt_keys = {
+        language: {(prompt.group, prompt.id) for prompt in language_prompts}
+        for language, language_prompts in prompts.items()
+    }
 
     app = Quart("piper", template_folder=str(_DIR / "templates"))
     app.config["TEMPLATES_AUTO_RELOAD"] = True
@@ -96,14 +114,21 @@ def main() -> None:
     async def api_record() -> str:
         """Record audio for a text prompt"""
         language = request.args["language"]
+        if language not in prompts:
+            raise ValueError("Unknown language")
 
         if args.multi_user:
             user_id = request.args.get("userId")
-            audio_dir = output_dir / f"user_{user_id}"
-            user_dir = audio_dir / language
-            if not user_dir.is_dir():
+            if is_safe_user_id(user_id):
+                audio_dir = output_dir / f"user_{user_id}"
+                user_dir = audio_dir / language
+            else:
+                audio_dir = None
+                user_dir = None
+            if not user_dir or not user_dir.is_dir():
                 _LOGGER.warning("No user/language directory: %s", user_dir)
                 user_id = None
+                audio_dir = output_dir / "__invalid_login__"
         else:
             user_id = None
             audio_dir = output_dir
@@ -140,15 +165,31 @@ def main() -> None:
         prompt_text = form["text"]
         audio_format = form["format"]
 
+        # Only accept (language, promptGroup, promptId) that correspond to a
+        # real prompt loaded from disk at startup — never trust these values
+        # directly when building filesystem paths, since they otherwise let a
+        # client write anywhere the server process can (including escaping
+        # output_dir entirely via an absolute path or "..").
+        if (prompt_group, prompt_id) not in prompt_keys.get(language, ()):
+            raise ValueError("Unknown prompt")
+
         files = await request.files
         assert "audio" in files, "No audio"
 
-        suffix = ".webm"
         if "wav" in audio_format:
             suffix = ".wav"
+        elif "ogg" in audio_format:
+            suffix = ".ogg"
+        elif "mp4" in audio_format or "aac" in audio_format:
+            suffix = ".mp4"
+        else:
+            suffix = ".webm"
 
         if args.multi_user:
             user_id = form["userId"]
+            if not is_safe_user_id(user_id):
+                raise ValueError("Invalid login code")
+
             user_dir = output_dir / f"user_{user_id}"
             if not user_dir.is_dir():
                 _LOGGER.warning("No user/language directory: %s", user_dir)
@@ -160,6 +201,10 @@ def main() -> None:
 
         # Save audio and transcription
         audio_path = audio_dir / language / prompt_group / f"{prompt_id}{suffix}"
+        # Belt-and-suspenders: even with the checks above, make sure the
+        # resolved path never lands outside audio_dir before writing to it.
+        if audio_dir.resolve() not in audio_path.resolve().parents:
+            raise ValueError("Invalid prompt path")
         _LOGGER.debug("Saving to %s", audio_path)
 
         audio_path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,9 +239,14 @@ def main() -> None:
     async def api_upload() -> str:
         """Upload an existing dataset"""
         language = request.args["language"]
+        if language not in prompts:
+            raise ValueError("Unknown language")
 
         if args.multi_user:
             user_id = request.args.get("userId")
+            if not is_safe_user_id(user_id):
+                raise RuntimeError("Invalid login code")
+
             audio_dir = output_dir / f"user_{user_id}"
             user_dir = audio_dir / language
             if not user_dir.is_dir():
@@ -218,9 +268,14 @@ def main() -> None:
         """Upload an existing dataset"""
         form = await request.form
         language = form["language"]
+        if language not in prompts:
+            raise ValueError("Unknown language")
 
         if args.multi_user:
             user_id = form.get("userId")
+            if not is_safe_user_id(user_id):
+                raise RuntimeError("Invalid login code")
+
             audio_dir = output_dir / f"user_{user_id}"
             user_dir = audio_dir / language
             if not user_dir.is_dir():
@@ -233,6 +288,8 @@ def main() -> None:
         files = await request.files
         dataset_file = files["dataset"]
         upload_path = user_dir / "_uploads" / Path(dataset_file.filename).name
+        if user_dir.resolve() not in upload_path.resolve().parents:
+            raise ValueError("Invalid upload path")
         upload_path.parent.mkdir(parents=True, exist_ok=True)
         await dataset_file.save(upload_path)
         _LOGGER.debug("Saved dataset to %s", upload_path)
@@ -243,7 +300,11 @@ def main() -> None:
     async def handle_error(err) -> Tuple[str, int]:
         """Return error as text."""
         _LOGGER.exception(err)
-        return (f"{err.__class__.__name__}: {err}", 500)
+        if args.debug:
+            return (f"{err.__class__.__name__}: {err}", 500)
+        # Don't leak internal details (e.g. filesystem paths) to a public
+        # client outside of local debugging.
+        return (err.__class__.__name__, 500)
 
     @app.route("/css/<path:filename>", methods=["GET"])
     async def css(filename) -> Response:
