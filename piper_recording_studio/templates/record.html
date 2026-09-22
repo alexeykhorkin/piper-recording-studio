@@ -145,7 +145,7 @@
              recording = false;
              recorder.stop();
 
-             blob = new Blob(chunks, { 'type' : 'audio/webm' });
+             blob = new Blob(chunks, { 'type' : audioFormat });
 
              // Audio preview
              q('#clip').src = window.URL.createObjectURL(blob);
@@ -245,12 +245,6 @@
               q('#submit').disabled = true;
               q('#skip').disabled = true;
 
-              const preferredFormat = 'audio/ogg; codecs=opus';
-              const audio = document.createElement('audio');
-              audioFormat = audio.canPlayType(preferredFormat)
-                  ? preferredFormat
-                  : 'audio/wav';
-
               wavesurfer = WaveSurfer.create({
                   container: q('#waveform'),
                   interact: false,
@@ -262,11 +256,29 @@
               });
 
               wavesurfer.microphone.on('deviceReady', function(stream) {
-                  if (MediaRecorder === undefined) {
-                      recorder = new window.MediaRecorder(stream);
-                  } else {
-                      recorder = new MediaRecorder(stream);
+                  if (wavesurfer.backend && wavesurfer.backend.getAudioContext) {
+                      wavesurfer.backend.getAudioContext().resume();
                   }
+                  var MR = window.MediaRecorder;
+                  var candidates = [
+                      'audio/webm;codecs=opus',
+                      'audio/webm',
+                      'audio/ogg;codecs=opus',
+                      'audio/mp4',
+                      'audio/wav'
+                  ];
+                  var chosenMimeType = '';
+                  for (var i = 0; i < candidates.length; i++) {
+                      if (MR.isTypeSupported && MR.isTypeSupported(candidates[i])) {
+                          chosenMimeType = candidates[i];
+                          break;
+                      }
+                  }
+
+                  recorder = chosenMimeType
+                      ? new MR(stream, { mimeType: chosenMimeType })
+                      : new MR(stream);
+                  audioFormat = recorder.mimeType || chosenMimeType || 'audio/webm';
 
                   q('#record').disabled = false;
                   q('#skip').disabled = false;
@@ -312,6 +324,9 @@
 
               q('[data-action="enable"]')
                   .addEventListener('click', function() {
+                      if (wavesurfer.backend && wavesurfer.backend.getAudioContext) {
+                          wavesurfer.backend.getAudioContext().resume();
+                      }
                       wavesurfer.microphone.start();
                       q('#record').hidden = false;
                       q('#enable').hidden = true;
